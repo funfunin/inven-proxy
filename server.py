@@ -22,6 +22,17 @@ Endpoints:
                     Media is extracted from each post's own page: <video>
                     data-src/src for videos, <img> src on upload*.inven.co.kr
                     under /bbs/ for photos. A post with no media gets "media": [].
+  GET /api/x?q=<keyword>&limit=10 -> {"updated_at", "total", "matched":
+                    [{"id","text","author":{"name","handle","avatar"},
+                    "created_at","url","media":[{"type":"photo"|"video",
+                    "src":"<url>"}]}]}. Keyword search of public X posts
+                    via Weir (POST /v1/x/search, key from the WEIR_API_KEY
+                    env var — the key is never in this file). X media URLs
+                    (pbs.twimg.com / video.twimg.com) are returned directly:
+                    they allow hotlinking, so the hub loads them without
+                    /media. Per-query 60s cache, min 2s between upstream
+                    calls, limit capped at 10. Missing key -> clean error
+                    JSON (502), never a crash, never a leak.
   GET /media?url=<urlencoded Inven CDN URL> -> the media bytes, streamed.
                     Only https://upload*.inven.co.kr URLs are allowed (anything
                     else -> 400), so this cannot be abused as an open proxy.
@@ -327,6 +338,196 @@ def get_payload(query=None):
                 "total": 0, "matched": [], "stale": False, "error": str(e)}, True
 
 
+# --- X search via Weir ----------------------------------------------------
+# POST /v1/x/search (docs.weirapp.io/reference/x/searchX, read 2026-11-24).
+# Request: {"query": str, "sort": "latest", "limit": 1..100}; auth
+# Authorization: Bearer <key>. Price 1 credit/call + 1/post; the call
+# counts as 2 against the per-minute rate limit (free tier: 30/min).
+# Response: {"data": [{id, text, url, lang, createdAt, author:
+# {id, username, name, verified, followersCount, profileImageUrl},
+# likeCount, retweetCount, replyCount, viewCount, media: [{id, type:
+# "photo"|"video"|"animated_gif", url, previewImageUrl}], ...}],
+# "meta": {"nextCursor": ...}}. media[].url is the original upload for a
+# photo and the highest-bitrate MP4 for a video/GIF; null when X offers
+# only a stream (then the item is dropped — the post still shows).
+WEIR_API_URL = os.environ.get(
+    "WEIR_API_URL", "https://api.weirapp.io/v1/x/search")
+WEIR_TIMEOUT = 15  # seconds per upstream call
+X_MIN_INTERVAL = 2.0  # seconds between upstream Weir calls (pacing)
+X_CACHE_TTL = 60
+X_LIMIT_MAX = 10
+X_LIMIT_DEFAULT = 10
+
+_x_caches = {}  # (query, limit) -> {"at", "payload"}
+_x_last_call = 0.0
+_x_lock = threading.Lock()
+
+
+def _weir_media_of(raw):
+    """Media array from a Weir post, defensively: the documented
+    media[] shape first, then top-level photos/videos lists (other
+    Weir endpoints / older shapes), then single photo/video URL
+    fields. Anything without a usable URL is dropped; a video whose
+    only URL is a poster frame is dropped too (a <video> cannot play
+    a still image). animated_gif is a video (mp4)."""
+    media, seen = [], set()
+
+    def add(kind, src, poster=""):
+        if not src or not isinstance(src, str):
+            return
+        src = src.strip()
+        if not src.startswith(("http://", "https://")) or src in seen:
+            return
+        seen.add(src)
+        item = {"type": kind, "src": src}
+        if poster and poster.startswith(("http://", "https://")):
+            item["poster"] = poster
+        media.append(item)
+
+    items = raw.get("media")
+    if isinstance(items, list):
+        for m in items:
+            if not isinstance(m, dict):
+                continue
+            t = str(m.get("type") or "").lower()
+            url = m.get("url") or ""
+            poster = m.get("previewImageUrl") or ""
+            if t == "photo":
+                add("photo", url)
+            elif t in ("video", "animated_gif"):
+                add("video", url, poster)
+            elif url:
+                # Unknown type with a URL: treat .mp4 as video, else photo.
+                add("video" if url.lower().split("?")[0].endswith(".mp4") else "photo",
+                    url, poster)
+    for key in ("photos", "images"):
+        val = raw.get(key)
+        if isinstance(val, list):
+            for u in val:
+                add("photo", u if isinstance(u, str) else
+                    (u.get("url") if isinstance(u, dict) else ""))
+    for key in ("videos",):
+        val = raw.get(key)
+        if isinstance(val, list):
+            for u in val:
+                add("video", u if isinstance(u, str) else
+                    (u.get("url") if isinstance(u, dict) else ""))
+    return media
+
+
+def _normalize_weir_post(raw):
+    """One Weir post -> the hub's shape. Missing fields degrade to
+    empty strings / [] — a malformed post never breaks the list."""
+    if not isinstance(raw, dict):
+        return None
+    pid = str(raw.get("id") or "")
+    if not pid:
+        return None
+    author = raw.get("author") or {}
+    if not isinstance(author, dict):
+        author = {}
+    handle = str(author.get("username") or "")
+    name = str(author.get("name") or handle or "")
+    url = str(raw.get("url") or "")
+    if not url:
+        url = f"https://x.com/i/status/{pid}"
+    return {
+        "id": pid,
+        "text": str(raw.get("text") or ""),
+        "author": {
+            "name": name,
+            "handle": handle,
+            "avatar": str(author.get("profileImageUrl") or ""),
+        },
+        "created_at": str(raw.get("createdAt") or ""),
+        "url": url,
+        "media": _weir_media_of(raw),
+    }
+
+
+def fetch_weir_search(query, limit):
+    """POST /v1/x/search. Raises RuntimeError("WEIR_API_KEY is not
+    configured") when the env var is missing — the caller turns that
+    into a clean error JSON; the key itself is never logged or
+    returned. WEIR_API_URL is overridable by env for local testing
+    against a mock server."""
+    key = os.environ.get("WEIR_API_KEY") or ""
+    if not key:
+        raise RuntimeError("WEIR_API_KEY is not configured")
+    body = json.dumps({"query": query, "sort": "latest",
+                       "limit": limit}).encode("utf-8")
+    req = urllib.request.Request(
+        WEIR_API_URL, data=body, method="POST",
+        headers={"Authorization": "Bearer " + key,
+                 "Content-Type": "application/json",
+                 "User-Agent": UA["User-Agent"]})
+    with urllib.request.urlopen(req, timeout=WEIR_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    posts = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(posts, list):
+        raise RuntimeError("unexpected Weir response shape")
+    return [_normalize_weir_post(p) for p in posts if _normalize_weir_post(p)]
+
+
+def get_x_payload(query, limit):
+    """Cached X search -> (payload, failed). Same contract as
+    get_payload: fresh cache hit returns immediately; on upstream
+    error a stale cached payload is served with stale=True; with no
+    cache at all the error payload is returned and failed=True (the
+    handler then answers 502). Upstream calls are paced to at most
+    one per X_MIN_INTERVAL seconds."""
+    global _x_last_call
+    q = (query or "").strip()
+    if not q:
+        return {"updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "total": 0, "matched": [], "stale": False,
+                "error": "empty query"}, True
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = X_LIMIT_DEFAULT
+    limit = max(1, min(X_LIMIT_MAX, limit))
+    key = (q.casefold(), limit)
+    now = time.time()
+    with _x_lock:
+        entry = _x_caches.get(key)
+        if entry is not None and now - entry["at"] < X_CACHE_TTL:
+            return entry["payload"], False
+    try:
+        # Pace upstream calls: at most one per X_MIN_INTERVAL seconds.
+        # (Wait outside the lock so other requests are not stalled.)
+        with _x_lock:
+            wait = X_MIN_INTERVAL - (time.time() - _x_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        matched = fetch_weir_search(q, limit)
+        with _x_lock:
+            _x_last_call = time.time()
+        payload = {
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "total": len(matched),
+            "matched": matched,
+            "stale": False,
+        }
+        with _x_lock:
+            if len(_x_caches) >= _MAX_CACHE_KEYS:
+                oldest = min(_x_caches, key=lambda k: _x_caches[k]["at"])
+                del _x_caches[oldest]
+            _x_caches[key] = {"at": now, "payload": payload}
+        return payload, False
+    except Exception as e:
+        with _x_lock:
+            entry = _x_caches.get(key)
+            old = entry["payload"] if entry is not None else None
+        if old is not None:
+            stale = dict(old)
+            stale["stale"] = True
+            stale["error"] = str(e)
+            return stale, False
+        return {"updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "total": 0, "matched": [], "stale": False, "error": str(e)}, True
+
+
 # --- media passthrough ----------------------------------------------------
 # Inven's CDN rejects embedded media requests whose Referer is a foreign
 # origin (HTTP 403), so the hub cannot load remote videos/photos directly
@@ -442,6 +643,12 @@ class Handler(BaseHTTPRequestHandler):
             q = (qs.get("q") or [""])[0]
             payload, failed = get_payload(q)
             self._send_json(502 if failed else 200, payload)
+        elif parsed.path in ("/api/x", "/api/x/"):
+            qs = urllib.parse.parse_qs(parsed.query)
+            q = (qs.get("q") or [""])[0]
+            limit = (qs.get("limit") or [""])[0]
+            payload, failed = get_x_payload(q, limit)
+            self._send_json(502 if failed else 200, payload)
         elif parsed.path in ("/health", "/health/"):
             body = b"ok"
             self.send_response(200)
@@ -454,6 +661,7 @@ class Handler(BaseHTTPRequestHandler):
             body = ("inven-proxy is up.\n"
                     "GET /api/inven -> matched posts as JSON (CORS enabled).\n"
                     "GET /api/inven?q=<keyword> -> native board search (title+content, whole board, newest 20).\n"
+                    "GET /api/x?q=<keyword>&limit=10 -> X keyword search via Weir (newest 10).\n"
                     "GET /media?url=<Inven CDN URL> -> streamed media bytes.\n").encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
