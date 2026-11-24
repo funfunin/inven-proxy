@@ -9,8 +9,14 @@ CORS enabled, letting the mini app fetch live data.
 
 Stdlib only — no dependencies, no secrets, no database.
 Endpoints:
-  GET /api/inven  -> {"updated_at", "total", "matched": [{"id","title","url",
-                    "media": [{"type": "video"|"photo", "src": "<url>"}]}]}
+  GET /api/inven[?q=<keyword>] -> {"updated_at", "total", "matched":
+                    [{"id","title","url", "media": [{"type": "video"|"photo",
+                    "src": "<url>"}]}]}. Without q: titles containing ㅇㅎ/ㅎㅂ/
+                    약후/후방. With q: titles containing q as a substring
+                    (case-insensitive for Latin letters) across ALL board
+                    posts. The 60s list cache is per query (keyed by the
+                    normalized query), so a search never returns another
+                    query's cached list.
                     Media is extracted from each post's own page: <video>
                     data-src/src for videos, <img> src on upload*.inven.co.kr
                     under /bbs/ for photos. A post with no media gets "media": [].
@@ -185,21 +191,44 @@ def enrich_media(matched):
     return matched
 
 
-_cache = {"at": 0.0, "payload": None}
+_caches = {}  # normalized-query key (None = default feed) -> {"at", "payload"}
 _cache_lock = threading.Lock()
+_MAX_CACHE_KEYS = 32
 
 
-def get_payload():
-    """Cached (total, matched) -> JSON-ready dict. Serves stale data on error."""
+def _normalize_query(query):
+    """Empty/missing/whitespace-only query -> None (the default feed).
+    Otherwise the stripped query, casefolded for the cache key."""
+    q = (query or "").strip()
+    return q.casefold() if q else None
+
+
+def _matches_query(title, qkey, qraw):
+    """Default feed: the ㅇㅎ/ㅎㅂ keyword filter. A search query: the
+    query as a substring of the title (case-insensitive for Latin
+    letters via casefold; Korean substring as-is)."""
+    if qkey is None:
+        return matches(title)
+    return qraw in title.casefold()
+
+
+def get_payload(query=None):
+    """Cached (total, matched) -> JSON-ready dict. Serves stale data on error.
+    The cache is per query: each normalized query has its own entry and
+    timestamp, so a search for "A" can never return the cached list for
+    "B" or for the default feed."""
+    qkey = _normalize_query(query)
+    qraw = (query or "").strip().casefold() if qkey is not None else ""
     now = time.time()
     with _cache_lock:
-        if _cache["payload"] is not None and now - _cache["at"] < CACHE_TTL:
-            return _cache["payload"], False
+        entry = _caches.get(qkey)
+        if entry is not None and now - entry["at"] < CACHE_TTL:
+            return entry["payload"], False
     try:
         posts = fetch_posts()
         matched = [{"id": pid, "title": t,
                     "url": f"https://www.inven.co.kr/board/webzine/2097/{pid}"}
-                   for pid, t in posts.items() if matches(t)]
+                   for pid, t in posts.items() if _matches_query(t, qkey, qraw)]
         enrich_media(matched)  # adds "media" per post; failures -> []
         payload = {
             "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -208,12 +237,15 @@ def get_payload():
             "stale": False,
         }
         with _cache_lock:
-            _cache["at"] = now
-            _cache["payload"] = payload
+            if len(_caches) >= _MAX_CACHE_KEYS:
+                oldest = min(_caches, key=lambda k: _caches[k]["at"])
+                del _caches[oldest]
+            _caches[qkey] = {"at": now, "payload": payload}
         return payload, False
     except Exception as e:
         with _cache_lock:
-            old = _cache["payload"]
+            entry = _caches.get(qkey)
+            old = entry["payload"] if entry is not None else None
         if old is not None:
             stale = dict(old)
             stale["stale"] = True
@@ -334,7 +366,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/media":
             self._serve_media(head_only=False)
         elif parsed.path in ("/api/inven", "/api/inven/"):
-            payload, failed = get_payload()
+            qs = urllib.parse.parse_qs(parsed.query)
+            q = (qs.get("q") or [""])[0]
+            payload, failed = get_payload(q)
             self._send_json(502 if failed else 200, payload)
         elif parsed.path in ("/health", "/health/"):
             body = b"ok"
@@ -347,6 +381,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path in ("/", ""):
             body = ("inven-proxy is up.\n"
                     "GET /api/inven -> matched posts as JSON (CORS enabled).\n"
+                    "GET /api/inven?q=<keyword> -> title-substring search.\n"
                     "GET /media?url=<Inven CDN URL> -> streamed media bytes.\n").encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
