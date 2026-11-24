@@ -24,7 +24,7 @@ Endpoints:
                     under /bbs/ for photos. A post with no media gets "media": [].
   GET /api/inven?all=1 -> same shape, but ALL page-1 posts that have
                     >=1 media item (photo or video, any type), newest
-                    first, capped at 20; "total" is the number of
+                    first, capped at 40; "total" is the number of
                     media posts BEFORE the cap. Own 60s cache, separate
                     from the feed/search caches; stale-on-error fallback.
   GET /api/x?q=<keyword>&limit=10 -> {"updated_at", "total", "matched":
@@ -71,7 +71,7 @@ BOARD_URL = "https://www.inven.co.kr/board/webzine/2097"
 SEARCH_URL = ("https://www.inven.co.kr/board/webzine/2097"
               "?query=list&p={page}&sterm=&name=subjcont&keyword={keyword}")
 SEARCH_CAP = 20  # max search results returned; search page 1 holds ~25 rows
-ALL_CAP = 20  # max ?all=1 results returned (page 1 holds ~63 posts)
+ALL_CAP = 40  # max ?all=1 results returned (page 1 holds ~63 posts); raised from 20 so the hub's shuffled 전체 pool is bigger
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 KEYWORDS = ("ㅇㅎ", "ㅎㅂ", "약후", "후방")
 CACHE_TTL = 60  # seconds; Inven page 1 changes slowly, don't hammer it
@@ -733,7 +733,7 @@ class Handler(BaseHTTPRequestHandler):
             body = ("inven-proxy is up.\n"
                     "GET /api/inven -> matched posts as JSON (CORS enabled).\n"
                     "GET /api/inven?q=<keyword> -> native board search (title+content, whole board, newest 20).\n"
-                    "GET /api/inven?all=1 -> all page-1 posts with media (newest 20).\n"
+                    "GET /api/inven?all=1 -> all page-1 posts with media (newest 40).\n"
                     "GET /api/x?q=<keyword>&limit=10 -> X keyword search via Weir (newest 10).\n"
                     "GET /media?url=<Inven CDN URL> -> streamed media bytes.\n").encode("utf-8")
             self.send_response(200)
