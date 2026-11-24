@@ -12,9 +12,11 @@ Endpoints:
   GET /api/inven[?q=<keyword>] -> {"updated_at", "total", "matched":
                     [{"id","title","url", "media": [{"type": "video"|"photo",
                     "src": "<url>"}]}]}. Without q: titles containing ㅇㅎ/ㅎㅂ/
-                    약후/후방. With q: titles containing q as a substring
-                    (case-insensitive for Latin letters) across ALL board
-                    posts. The 60s list cache is per query (keyed by the
+                    약후/후방 on the board list page 1. With q: Inven's own
+                    native board search (name=subjcont = title+content,
+                    whole board history, newest first), capped at 20 posts;
+                    "total" is then the number of matched posts returned.
+                    The 60s list cache is per query (keyed by the
                     normalized query), so a search never returns another
                     query's cached list.
                     Media is extracted from each post's own page: <video>
@@ -50,6 +52,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BOARD_URL = "https://www.inven.co.kr/board/webzine/2097"
+SEARCH_URL = ("https://www.inven.co.kr/board/webzine/2097"
+              "?query=list&p={page}&sterm=&name=subjcont&keyword={keyword}")
+SEARCH_CAP = 20  # max search results returned; search page 1 holds ~25 rows
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 KEYWORDS = ("ㅇㅎ", "ㅎㅂ", "약후", "후방")
 CACHE_TTL = 60  # seconds; Inven page 1 changes slowly, don't hammer it
@@ -57,6 +62,20 @@ CACHE_TTL = 60  # seconds; Inven page 1 changes slowly, don't hammer it
 
 def matches(title):
     return any(k in title for k in KEYWORDS)
+
+
+def _title_from_anchor(inner):
+    """Post title from a subject-link anchor's inner HTML: thumbnail rows
+    carry it in <span class="txt">, plain rows in <b>."""
+    m = re.search(r'<span class="txt">(.*?)</span>', inner, re.S)
+    if not m:
+        m = re.search(r'<b>(.*?)</b>', inner, re.S)
+    if m:
+        raw = m.group(1)
+    else:
+        raw = re.sub(r"^\[[^\]]+\]\s*", "", re.sub(r"<[^>]+>", "", inner))
+    title = html.unescape(re.sub(r"<[^>]+>", "", raw))
+    return re.sub(r"\s+", " ", title).strip()
 
 
 def fetch_posts():
@@ -69,18 +88,59 @@ def fetch_posts():
     anchor_pat = re.compile(
         r'<a[^>]*href="https?://www\.inven\.co\.kr/board/webzine/2097/(\d+)[^"]*"[^>]*>(.*?)</a>', re.S)
     for pid, inner in anchor_pat.findall(src):
-        m = re.search(r'<span class="txt">(.*?)</span>', inner, re.S)
-        if not m:
-            m = re.search(r'<b>(.*?)</b>', inner, re.S)
-        if m:
-            raw = m.group(1)
-        else:
-            raw = re.sub(r"^\[[^\]]+\]\s*", "", re.sub(r"<[^>]+>", "", inner))
-        title = html.unescape(re.sub(r"<[^>]+>", "", raw))
-        title = re.sub(r"\s+", " ", title).strip()
+        title = _title_from_anchor(inner)
         if title and pid not in posts:
             posts[pid] = title
     return posts
+
+
+def _parse_search_page(src):
+    """Result rows from a native board-search page: ONLY the rows of the
+    list table (<table class="thumbnail"> <tbody>), excluding pinned
+    notice rows (class "notice ..."). The page also carries a hot-posts
+    widget (ul.site-list) and the notices with board links — those are
+    NOT search results, so a whole-page anchor scan (what fetch_posts
+    does) must not be used here: verified 2026-11-24, the unscoped scan
+    returned 44 links for keyword=비키니 while the list table holds 25
+    real results + 3 notices."""
+    m = re.search(r'<table class="thumbnail">.*?<tbody>(.*?)</tbody>', src, re.S)
+    if not m:
+        return {}
+    anchor_pat = re.compile(
+        r'<a[^>]*href="https?://www\.inven\.co\.kr/board/webzine/2097/(\d+)[^"]*"[^>]*>(.*?)</a>', re.S)
+    posts = {}
+    for row in re.finditer(r'<tr class="([^"]*)">(.*?)</tr>', m.group(1), re.S):
+        if "notice" in row.group(1):
+            continue
+        for pid, inner in anchor_pat.findall(row.group(2)):
+            title = _title_from_anchor(inner)
+            if title and pid not in posts:
+                posts[pid] = title
+    return posts
+
+
+def fetch_search_posts(query):
+    """Native board search (title+content, whole board history, newest
+    first). Page 1 first; if it yields fewer than SEARCH_CAP results,
+    also try p=2 and append (dedupe by id). Capped at SEARCH_CAP.
+    NOTE (verified 2026-11-24): Inven search does not paginate with p= —
+    p=2 comes back with an empty list ("작성된 게시글이 없습니다");
+    deeper history needs the page's '다음검색' sterm cursor, which this
+    does not follow. p=1 alone returns up to ~25 rows, so the cap is
+    what binds, not pagination."""
+    keyword = urllib.parse.quote(query, safe="")
+    posts = {}
+    for page in (1, 2):
+        url = SEARCH_URL.format(page=page, keyword=keyword)
+        req = urllib.request.Request(url, headers=UA)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            src = resp.read().decode("utf-8", errors="replace")
+        for pid, title in _parse_search_page(src).items():
+            if pid not in posts:
+                posts[pid] = title
+        if len(posts) >= SEARCH_CAP:
+            break
+    return dict(list(posts.items())[:SEARCH_CAP])
 
 
 # --- per-post media -------------------------------------------------------
@@ -225,14 +285,26 @@ def get_payload(query=None):
         if entry is not None and now - entry["at"] < CACHE_TTL:
             return entry["payload"], False
     try:
-        posts = fetch_posts()
-        matched = [{"id": pid, "title": t,
-                    "url": f"https://www.inven.co.kr/board/webzine/2097/{pid}"}
-                   for pid, t in posts.items() if _matches_query(t, qkey, qraw)]
+        if qkey is not None:
+            # Search: Inven's native board search already matched
+            # title+content across the whole board history — every row
+            # returned is a match, no client-side filtering. total is
+            # the number of matched posts returned (capped at 20).
+            posts = fetch_search_posts(query.strip())
+            matched = [{"id": pid, "title": t,
+                        "url": f"https://www.inven.co.kr/board/webzine/2097/{pid}"}
+                       for pid, t in posts.items()]
+            total = len(matched)
+        else:
+            posts = fetch_posts()
+            matched = [{"id": pid, "title": t,
+                        "url": f"https://www.inven.co.kr/board/webzine/2097/{pid}"}
+                       for pid, t in posts.items() if _matches_query(t, qkey, qraw)]
+            total = len(posts)
         enrich_media(matched)  # adds "media" per post; failures -> []
         payload = {
             "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "total": len(posts),
+            "total": total,
             "matched": matched,
             "stale": False,
         }
@@ -381,7 +453,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path in ("/", ""):
             body = ("inven-proxy is up.\n"
                     "GET /api/inven -> matched posts as JSON (CORS enabled).\n"
-                    "GET /api/inven?q=<keyword> -> title-substring search.\n"
+                    "GET /api/inven?q=<keyword> -> native board search (title+content, whole board, newest 20).\n"
                     "GET /media?url=<Inven CDN URL> -> streamed media bytes.\n").encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
