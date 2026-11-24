@@ -22,6 +22,11 @@ Endpoints:
                     Media is extracted from each post's own page: <video>
                     data-src/src for videos, <img> src on upload*.inven.co.kr
                     under /bbs/ for photos. A post with no media gets "media": [].
+  GET /api/inven?all=1 -> same shape, but ALL page-1 posts that have
+                    >=1 media item (photo or video, any type), newest
+                    first, capped at 20; "total" is the number of
+                    media posts BEFORE the cap. Own 60s cache, separate
+                    from the feed/search caches; stale-on-error fallback.
   GET /api/x?q=<keyword>&limit=10 -> {"updated_at", "total", "matched":
                     [{"id","text","author":{"name","handle","avatar"},
                     "created_at","url","media":[{"type":"photo"|"video",
@@ -66,6 +71,7 @@ BOARD_URL = "https://www.inven.co.kr/board/webzine/2097"
 SEARCH_URL = ("https://www.inven.co.kr/board/webzine/2097"
               "?query=list&p={page}&sterm=&name=subjcont&keyword={keyword}")
 SEARCH_CAP = 20  # max search results returned; search page 1 holds ~25 rows
+ALL_CAP = 20  # max ?all=1 results returned (page 1 holds ~63 posts)
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 KEYWORDS = ("ㅇㅎ", "ㅎㅂ", "약후", "후방")
 CACHE_TTL = 60  # seconds; Inven page 1 changes slowly, don't hammer it
@@ -245,13 +251,17 @@ def fetch_post_media(pid):
     return media
 
 
-def enrich_media(matched):
+def enrich_media(matched, max_workers=8):
     """Attach a "media" array to each matched item. Post pages are fetched
-    in parallel (max 8 at once); posts still unfinished when the budget
-    runs out just get "media": []."""
+    in parallel; posts still unfinished when the budget runs out just get
+    "media": []. The pool is shut down WITHOUT waiting (wait=False,
+    cancel_futures=True) — otherwise the response would block until the
+    slowest straggler finishes, far past the budget (verified: 63 posts
+    took ~35s end-to-end with a 10s budget before this fix)."""
     if not matched:
         return matched
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futs = {pool.submit(fetch_post_media, m["id"]): m for m in matched}
         done, _ = concurrent.futures.wait(futs, timeout=ENRICH_BUDGET)
         for fut, item in futs.items():
@@ -259,6 +269,8 @@ def enrich_media(matched):
                 item["media"] = fut.result() if fut in done else []
             except Exception:
                 item["media"] = []
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return matched
 
 
@@ -329,6 +341,63 @@ def get_payload(query=None):
         with _cache_lock:
             entry = _caches.get(qkey)
             old = entry["payload"] if entry is not None else None
+        if old is not None:
+            stale = dict(old)
+            stale["stale"] = True
+            stale["error"] = str(e)
+            return stale, False
+        return {"updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "total": 0, "matched": [], "stale": False, "error": str(e)}, True
+
+
+# --- ?all=1: every media post on page 1 ---------------------------------
+_all_cache = {"at": 0.0, "payload": None}  # single-entry cache, own key
+
+
+def get_all_payload():
+    """All page-1 posts that have >=1 media item, newest first, capped
+    at ALL_CAP. Same enrichment (fetch_post_media, ENRICH_BUDGET) and
+    same response shape as get_payload, with 24 workers so most of the
+    ~63 post pages finish inside the budget; "total" is the number of
+    media posts BEFORE the cap. Own 60s cache (separate from the
+    feed/search caches — a search for "all" can never collide with
+    this), stale on error. Posts whose media fetch is still unfinished
+    when the budget runs out get "media": [] and are dropped from THIS
+    list — the next refresh retries them (only non-empty media is
+    cached, and finished posts answer from that cache instantly)."""
+    now = time.time()
+    with _cache_lock:
+        if _all_cache["payload"] is not None and now - _all_cache["at"] < CACHE_TTL:
+            return _all_cache["payload"], False
+    try:
+        posts = fetch_posts()
+        items = [{"id": pid, "title": t,
+                  "url": f"https://www.inven.co.kr/board/webzine/2097/{pid}"}
+                 for pid, t in posts.items()]
+        enrich_media(items, max_workers=24)  # adds "media" per post; unfinished -> []
+        with_media = [m for m in items if m.get("media")]
+        # Newest first: post ids are assigned sequentially, so a higher
+        # id is a newer post. (The whole-page anchor scan does NOT come
+        # back in list order — widget links interleave — so sort here
+        # instead of trusting fetch_posts' order. 24 workers: a post
+        # page takes ~3s from here, so 8 workers would only finish ~25
+        # of the ~63 pages inside the 10s budget.)
+        with_media.sort(key=lambda m: int(m["id"]), reverse=True)
+        total = len(with_media)
+        matched = with_media[:ALL_CAP]
+        payload = {
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "total": total,
+            "matched": matched,
+            "stale": False,
+        }
+        with _cache_lock:
+            _all_cache["at"] = now
+            _all_cache["payload"] = payload
+        return payload, False
+    except Exception as e:
+        with _cache_lock:
+            old = _all_cache["payload"]
         if old is not None:
             stale = dict(old)
             stale["stale"] = True
@@ -640,8 +709,11 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_media(head_only=False)
         elif parsed.path in ("/api/inven", "/api/inven/"):
             qs = urllib.parse.parse_qs(parsed.query)
-            q = (qs.get("q") or [""])[0]
-            payload, failed = get_payload(q)
+            if "1" in qs.get("all", []):
+                payload, failed = get_all_payload()
+            else:
+                q = (qs.get("q") or [""])[0]
+                payload, failed = get_payload(q)
             self._send_json(502 if failed else 200, payload)
         elif parsed.path in ("/api/x", "/api/x/"):
             qs = urllib.parse.parse_qs(parsed.query)
@@ -661,6 +733,7 @@ class Handler(BaseHTTPRequestHandler):
             body = ("inven-proxy is up.\n"
                     "GET /api/inven -> matched posts as JSON (CORS enabled).\n"
                     "GET /api/inven?q=<keyword> -> native board search (title+content, whole board, newest 20).\n"
+                    "GET /api/inven?all=1 -> all page-1 posts with media (newest 20).\n"
                     "GET /api/x?q=<keyword>&limit=10 -> X keyword search via Weir (newest 10).\n"
                     "GET /media?url=<Inven CDN URL> -> streamed media bytes.\n").encode("utf-8")
             self.send_response(200)
