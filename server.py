@@ -38,6 +38,19 @@ Endpoints:
                     /media. Per-query 60s cache, min 2s between upstream
                     calls, limit capped at 10. Missing key -> clean error
                     JSON (502), never a crash, never a leak.
+  GET /api/nimi?tab=popular|live|liked -> {"updated_at", "total",
+                    "matched": [{"id","platform","duration","plays",
+                    "likes","posted_at","author":{"name","handle",
+                    "avatar"},"url","watch_url","thumb","file_url",
+                    "hls_url"}]}. Nimi Wiki's own lists via api.nimi.wiki
+                    (server-side, so CORS is not an issue): popular =
+                    Bluesky ranking (sort=plays, past hour), live =
+                    Twitter realtime. file_url is the direct mp4 (the
+                    author's PDS getBlob for Bluesky, twimg for Twitter).
+                    liked needs a Nimi login session this proxy does not
+                    have -> clean error JSON (502); the hub keeps the
+                    /liked iframe instead of calling it. Per-tab 60s
+                    cache, one retry on timeout/5xx, stale on error.
   GET /media?url=<urlencoded Inven CDN URL> -> the media bytes, streamed.
                     Only https://upload*.inven.co.kr URLs are allowed (anything
                     else -> 400), so this cannot be abused as an open proxy.
@@ -55,6 +68,7 @@ Deploy: Render (free tier) — see render.yaml / README.md.
 """
 import concurrent.futures
 import html
+import http.client
 import json
 import os
 import re
@@ -597,6 +611,173 @@ def get_x_payload(query, limit):
                 "total": 0, "matched": [], "stale": False, "error": str(e)}, True
 
 
+# --- Nimi Wiki lists via api.nimi.wiki ------------------------------------
+# Nimi Wiki (video2.nimi.wiki) is a Nuxt SPA: the ranking pages carry no
+# list data in their SSR HTML (__NUXT_DATA__ has the feed key as null
+# and there are no /watch/ links), and the list JSON loads client-side
+# from https://api.nimi.wiki — verified 2026-11-26 by capturing the
+# browser's requests in real Chromium: the ranking page calls
+# GET /video/bs/ranking?sort=plays&period=hour, the live page calls
+# GET /video/tw/realtime (GET /video/bs/realtime also exists). Direct
+# browser calls are blocked by CORS (api.nimi.wiki answers ACAO only
+# for video2.nimi.wiki; a github.io Origin gets no ACAO header and
+# OPTIONS 400 — re-verified 2026-11-26), so the hub reads the lists
+# through this endpoint instead. Each item: id (Nimi video uuid),
+# platform (bs/tw/ig/tt), duration (seconds), total_play_count,
+# up/down votes, created_at, thumbnail_url, file_url (direct mp4: the
+# author's PDS getBlob for bs, twimg mp4 for tw, Instagram/TikTok CDN
+# for ig/tt), hls_url, posts[0] = the original post {url, author
+# {handle, name}, posted_at}. /video/liked answers 401 without a Nimi
+# login session, so the hub keeps the /liked iframe for the 좋아요 tab
+# and never calls this endpoint with tab=liked.
+NIMI_API_URL = os.environ.get("NIMI_API_URL", "https://api.nimi.wiki")
+NIMI_TIMEOUT = 15  # seconds per upstream call
+NIMI_CACHE_TTL = 60
+NIMI_TABS = {
+    "popular": "/video/bs/ranking?sort=plays&period=hour",
+    "live": "/video/tw/realtime",
+}
+_nimi_caches = {}  # tab -> {"at", "payload"}
+_nimi_lock = threading.Lock()
+
+
+def _normalize_nimi_item(raw):
+    """One Nimi video -> the hub's flat shape. Missing fields degrade
+    to empty strings / None — a malformed item never breaks the list.
+    Items without a direct mp4 or without any original-post URL are
+    dropped (the hub card needs both to play inline and link out)."""
+    if not isinstance(raw, dict):
+        return None
+    file_url = str(raw.get("file_url") or "")
+    if not file_url:
+        return None
+    posts = raw.get("posts") or []
+    post = posts[0] if isinstance(posts, list) and posts and isinstance(posts[0], dict) else {}
+    url = str(post.get("url") or "")
+    if not url:
+        return None
+    author = post.get("author") or {}
+    if not isinstance(author, dict):
+        author = {}
+    vid = str(raw.get("id") or "")
+
+    def _num(v):
+        return v if isinstance(v, (int, float)) else None
+
+    return {
+        "id": vid,
+        "platform": str(raw.get("platform") or ""),
+        "duration": _num(raw.get("duration")),
+        "plays": _num(raw.get("total_play_count")),
+        "likes": _num(raw.get("up")),
+        "posted_at": str(post.get("posted_at") or raw.get("created_at") or ""),
+        "author": {
+            "name": str(author.get("name") or author.get("handle") or ""),
+            "handle": str(author.get("handle") or ""),
+            "avatar": "",
+        },
+        "url": url,
+        "watch_url": f"https://video2.nimi.wiki/watch/{vid}" if vid else url,
+        "thumb": str(raw.get("thumbnail_url") or ""),
+        "file_url": file_url,
+        "hls_url": str(raw.get("hls_url") or ""),
+    }
+
+
+def fetch_nimi_list(tab):
+    """GET the upstream list for one tab. One retry on timeout / 5xx
+    (the list endpoint is a single call, so a retry is cheap); a 4xx
+    answer is definitive and raises immediately. Raises RuntimeError
+    with a short message on any failure — the caller turns it into a
+    clean error JSON; nothing upstream is ever logged or returned.
+    NIMI_API_URL is overridable by env for local testing against a
+    mock server."""
+    path = NIMI_TABS[tab]
+    url = NIMI_API_URL.rstrip("/") + path
+    last_exc = None
+    for attempt in (1, 2):
+        try:
+            req = urllib.request.Request(
+                url, headers={**UA, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=NIMI_TIMEOUT) as resp:
+                try:
+                    raw = resp.read()
+                except http.client.IncompleteRead as e:
+                    # A truncated read still carries the bytes that did
+                    # arrive (e.partial). If those bytes parse as a
+                    # complete JSON list, they ARE the whole answer (a
+                    # truncated array cannot parse) — use them. Otherwise
+                    # json.loads below raises and the retry/failure path
+                    # runs as usual.
+                    raw = e.partial
+                data = json.loads(raw.decode("utf-8", errors="replace"))
+            if not isinstance(data, list):
+                raise RuntimeError("unexpected Nimi response shape")
+            out = []
+            for it in data:
+                norm = _normalize_nimi_item(it)
+                if norm is not None:
+                    out.append(norm)
+            return out
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:
+                raise RuntimeError(f"Nimi answered HTTP {e.code}")
+            last_exc = e
+        except Exception as e:
+            last_exc = e
+        if attempt == 1:
+            time.sleep(0.5)
+    raise RuntimeError(f"Nimi fetch failed: {type(last_exc).__name__}")
+
+
+def get_nimi_payload(tab):
+    """Cached Nimi list -> (payload, failed). Same contract as
+    get_x_payload: fresh cache hit returns immediately; on upstream
+    error a stale cached payload is served with stale=True; with no
+    cache at all the error payload is returned and failed=True (the
+    handler then answers 502). tab=liked needs a Nimi login session
+    this proxy does not have, so it always answers the clean error
+    below instead of calling upstream."""
+    now = time.time()
+    if tab == "liked":
+        return {"updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "total": 0, "matched": [], "stale": False,
+                "error": "Nimi login required for liked videos"}, True
+    if tab not in NIMI_TABS:
+        return {"updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "total": 0, "matched": [], "stale": False,
+                "error": "unknown tab (popular|live|liked)"}, True
+    with _nimi_lock:
+        entry = _nimi_caches.get(tab)
+        if entry is not None and now - entry["at"] < NIMI_CACHE_TTL:
+            return entry["payload"], False
+    try:
+        matched = fetch_nimi_list(tab)
+        payload = {
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "total": len(matched),
+            "matched": matched,
+            "stale": False,
+        }
+        with _nimi_lock:
+            if len(_nimi_caches) >= _MAX_CACHE_KEYS:
+                oldest = min(_nimi_caches, key=lambda k: _nimi_caches[k]["at"])
+                del _nimi_caches[oldest]
+            _nimi_caches[tab] = {"at": now, "payload": payload}
+        return payload, False
+    except Exception as e:
+        with _nimi_lock:
+            entry = _nimi_caches.get(tab)
+            old = entry["payload"] if entry is not None else None
+        if old is not None:
+            stale = dict(old)
+            stale["stale"] = True
+            stale["error"] = str(e)
+            return stale, False
+        return {"updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "total": 0, "matched": [], "stale": False, "error": str(e)}, True
+
+
 # --- media passthrough ----------------------------------------------------
 # Inven's CDN rejects embedded media requests whose Referer is a foreign
 # origin (HTTP 403), so the hub cannot load remote videos/photos directly
@@ -721,6 +902,11 @@ class Handler(BaseHTTPRequestHandler):
             limit = (qs.get("limit") or [""])[0]
             payload, failed = get_x_payload(q, limit)
             self._send_json(502 if failed else 200, payload)
+        elif parsed.path in ("/api/nimi", "/api/nimi/"):
+            qs = urllib.parse.parse_qs(parsed.query)
+            tab = (qs.get("tab") or [""])[0]
+            payload, failed = get_nimi_payload(tab)
+            self._send_json(502 if failed else 200, payload)
         elif parsed.path in ("/health", "/health/"):
             body = b"ok"
             self.send_response(200)
@@ -735,6 +921,7 @@ class Handler(BaseHTTPRequestHandler):
                     "GET /api/inven?q=<keyword> -> native board search (title+content, whole board, newest 20).\n"
                     "GET /api/inven?all=1 -> all page-1 posts with media (newest 40).\n"
                     "GET /api/x?q=<keyword>&limit=10 -> X keyword search via Weir (newest 10).\n"
+                    "GET /api/nimi?tab=popular|live|liked -> Nimi Wiki lists via api.nimi.wiki (popular = Bluesky ranking, live = Twitter realtime; liked needs a Nimi login).\n"
                     "GET /media?url=<Inven CDN URL> -> streamed media bytes.\n").encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
